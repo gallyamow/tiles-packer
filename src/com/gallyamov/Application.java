@@ -61,13 +61,12 @@ public class Application {
 		createTable();
 
 		System.out.println("adding ...");
+
 		connection.setAutoCommit(false);
 		walk(new File(source));
-
 		if (taskFiles.size() > 0) {
-			waitAndInsertRecord();
+			insertAndWait();
 		}
-
 		connection.setAutoCommit(true);
 
 		System.out.println("indexing ...");
@@ -99,24 +98,22 @@ public class Application {
 			}
 
 			if (taskFiles.size() >= batchSize) {
-				waitAndInsertRecord();
+				insertAndWait();
 			}
 		}
 	}
 
-	private static void waitAndInsertRecord() throws SQLException, IOException, ExecutionException, InterruptedException {
+	private static void insertAndWait() throws SQLException, IOException, ExecutionException, InterruptedException {
 		ArrayList<Future<?>> tasks = new ArrayList<>();
+
+		String sql = "INSERT INTO " + tableName + " (z, x, y, data) VALUES (?, ?, ?, ?);";
+		final PreparedStatement stm = connection.prepareStatement(sql);
 
 		for (final File file : taskFiles) {
 			tasks.add(pool.submit(new Callable<Object>() {
 				@Override
 				public Object call() throws Exception {
-					PreparedStatement stm = makeInsertStatement(file);
-
-					if (stm != null) {
-						stm.executeUpdate();
-
-					}
+					addBatch(stm, file);
 					return null;
 				}
 			}));
@@ -126,49 +123,52 @@ public class Application {
 			task.get();
 		}
 
+		stm.executeBatch();
+		stm.close();
 		connection.commit();
-		count += taskFiles.size();
 
+		count += taskFiles.size();
 		System.out.println("count: " + count);
 
 		taskFiles.clear();
 	}
 
-	public static PreparedStatement makeInsertStatement(File file) throws SQLException, IOException {
+	public static void addBatch(PreparedStatement stm, File file) throws SQLException, IOException {
 		String fileName = file.getName();
 		String ext = file.getName().substring(fileName.lastIndexOf(".") + 1);
 
 		if (!ext.equals("png")) {
-			return null;
+			return;
 		}
 
 		Pattern p = Pattern.compile("(\\d+)/(\\d+)/(\\d+)\\." + ext);
 		Matcher m = p.matcher(file.getAbsolutePath());
 
 		if (!m.find()) {
-			return null;
+			return;
 		}
 
 		int z = Integer.valueOf(m.group(1));
 		int x = Integer.valueOf(m.group(2));
 		int y = Integer.valueOf(m.group(3));
+		byte[] data;
 
-		String sql = "INSERT INTO " + tableName + " (z, x, y, data) VALUES (?, ?, ?, ?);";
-
-		PreparedStatement stm = Application.connection.prepareStatement(sql);
-		stm.setInt(1, z);
-		stm.setInt(2, x);
-		stm.setInt(3, y);
-
-		try (BufferedInputStream is = new BufferedInputStream(new FileInputStream(file))) {
-			byte[] buf = new byte[(int) file.length()];  // setBlob, setBinaryStream не работает
-
-			if (is.read(buf) != -1) {
-				stm.setBytes(4, buf);
-			}
+		try (FileInputStream is = new FileInputStream(file); BufferedInputStream bis = new BufferedInputStream(is)) {
+			data = new byte[(int) file.length()];  // setBlob, setBinaryStream не работает
+			bis.read(data);
 		}
 
-		return stm;
+		synchronized (Application.class) {
+			stm.setInt(1, z);
+			stm.setInt(2, x);
+			stm.setInt(3, y);
+
+			if (data.length > 0) {
+				stm.setBytes(4, data);
+			}
+
+			stm.addBatch();
+		}
 	}
 
 	private static void parseCommandArgs(String args[]) throws ParseException {
@@ -197,6 +197,11 @@ public class Application {
 		int cores = Runtime.getRuntime().availableProcessors();
 		threadsCount = Integer.valueOf(cmd.getOptionValue("thread", String.valueOf(cores)));
 		batchSize = Integer.valueOf(cmd.getOptionValue("batch", String.valueOf(cores * 256)));
+
+//		source = "/archive/tiles_tatarstan/7";
+//		databaseFile = "/archive/tiles";
+//		tableName = "gis2";
+//		batchSize = 8000;
 	}
 
 	private static void connect() throws SQLException, ClassNotFoundException {
@@ -229,7 +234,7 @@ public class Application {
 	public static void createIndex() throws SQLException {
 		String sql = "CREATE INDEX zxy ON " + tableName + " (z, x, y)";
 
-		Statement statement = Application.connection.createStatement();
+		Statement statement = connection.createStatement();
 		statement.executeUpdate(sql);
 		statement.close();
 	}
